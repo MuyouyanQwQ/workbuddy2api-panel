@@ -14,10 +14,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/guard"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
@@ -293,6 +295,43 @@ func main() {
 	up.SetCreditObserver(creditHist.Observe)
 	log.Printf("[credithist] 积分历史已启用: %s", stateSibling(cfg.StateFile, "credit-history.json"))
 
+	// 试用守卫：监控名单内的试用/限免模型一旦产生 usage.credit（免费结束开始
+	// 计费），立即持久禁用并从 /v1/models 移除；到达 promo_valid_until 自动下线；
+	// 上游延长免费则自动复活（同一份已被证伪的声明除外）。
+	//   TRIAL_GUARD_ENABLED=false  关闭
+	//   TRIAL_GUARD_WATCH=a,b      监控名单（逗号分隔，可带 cn: 前缀）
+	//   TRIAL_GUARD_STATE=path     状态文件（默认 data/trial_guard.json）
+	//   TRIAL_GUARD_WINDOWS=模型|HH:MM-HH:MM|[星期1-7]|[block|allow]  时段规则
+	var trialGuard *guard.State
+	if !strings.EqualFold(os.Getenv("TRIAL_GUARD_ENABLED"), "false") {
+		guardPath := os.Getenv("TRIAL_GUARD_STATE")
+		if guardPath == "" {
+			guardPath = "data/trial_guard.json"
+		}
+		guardWatch := os.Getenv("TRIAL_GUARD_WATCH")
+		if guardWatch == "" {
+			guardWatch = "hy4-preview-f,step-5-preview,hy3"
+		}
+		trialGuard = guard.New(guardPath, strings.Split(guardWatch, ","))
+		for _, e := range trialGuard.List() {
+			log.Printf("WARN: [server] trial guard restored disabled model=%s reason=%s credit=%.4f at=%s",
+				e.Model, e.Reason, e.Credit, e.DetectedAt.Format(time.RFC3339))
+		}
+		for m, d := range trialGuard.Deadlines() {
+			log.Printf("INFO: [server] trial guard deadline model=%s at=%s", m, d.Format(time.RFC3339))
+		}
+		if spec := os.Getenv("TRIAL_GUARD_WINDOWS"); strings.TrimSpace(spec) != "" {
+			for _, r := range parseGuardWindows(spec) {
+				if err := trialGuard.SetWindow(r); err != nil {
+					log.Printf("WARN: [server] trial guard window rejected model=%s: %s", r.Model, err)
+					continue
+				}
+				log.Printf("INFO: [server] trial guard window model=%s %s-%s days=%v mode=%s",
+					r.Model, r.Start, r.End, r.Days, r.Mode)
+			}
+		}
+	}
+
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
@@ -345,6 +384,7 @@ func main() {
 		// 裸用/测试路径拿到同一缺省值。
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
+		TrialGuard:   trialGuard,
 		GlobalEnabled: cfg.Global.Enabled,
 		// 模型黑名单原始条目；运行期以 livecfg 快照为准（热生效），此处供
 		// Live 为 nil 的裸用/测试路径。
@@ -614,4 +654,49 @@ func mergedJSON(m map[string]any) []byte {
 		return []byte("{}")
 	}
 	return b
+}
+
+// parseGuardWindows 解析 TRIAL_GUARD_WINDOWS：
+//
+//	模型|HH:MM-HH:MM|[星期1-7连写]|[block|allow]，多条用逗号分隔
+//
+//	例：hy4-preview-f|23:00-08:00||allow   （只在夜间允许，白天强制熔断）
+//	    step-5-preview|09:00-18:00|12345|block （工作日白天强制熔断）
+func parseGuardWindows(spec string) []guard.WindowRule {
+	out := make([]guard.WindowRule, 0, 4)
+	for _, item := range strings.Split(spec, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		parts := strings.Split(item, "|")
+		if len(parts) < 2 {
+			continue
+		}
+		model := strings.TrimSpace(parts[0])
+		span := strings.SplitN(strings.TrimSpace(parts[1]), "-", 2)
+		if model == "" || len(span) != 2 {
+			continue
+		}
+		rule := guard.WindowRule{
+			Model: model,
+			Start: strings.TrimSpace(span[0]),
+			End:   strings.TrimSpace(span[1]),
+			Mode:  "block",
+		}
+		if len(parts) >= 3 {
+			for _, ch := range strings.TrimSpace(parts[2]) {
+				if ch >= '1' && ch <= '7' {
+					rule.Days = append(rule.Days, int(ch-'0'))
+				}
+			}
+		}
+		if len(parts) >= 4 {
+			if m := strings.ToLower(strings.TrimSpace(parts[3])); m != "" {
+				rule.Mode = m
+			}
+		}
+		out = append(out, rule)
+	}
+	return out
 }
