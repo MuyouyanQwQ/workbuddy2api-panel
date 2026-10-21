@@ -1,0 +1,5 @@
+# 本地增量镜像：只替换 /app/wb2api 二进制，运行时（python3/bash/tzdata/用户）
+# 全部沿用上游镜像，避免重新拉 alpine 基础镜像（registry 不稳定）。
+# 变更内容：/v1/models 透出 promo_* 时段字段（限时优惠可被客户端读取）。
+FROM ghcr.io/linguo2625469/workbuddy2api-panel:latest
+COPY out/wb2api /app/wb2api

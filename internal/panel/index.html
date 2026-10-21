@@ -281,6 +281,13 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .tag.warn { background: var(--warn-soft); color: var(--warn); }
 .tag.bad { background: var(--bad-soft); color: var(--bad); }
 .tag.mute { background: var(--surface-2); color: var(--ink-3); border: 1px solid var(--line); }
+/* 守卫卡片：复用账号表（table.acc）+ 筛选栏（fbar）原生样式，只补二级分节标题 */
+.guard-sec { display: flex; align-items: center; gap: 12px; padding: 11px 17px; border-bottom: 1px solid var(--line-soft); background: var(--surface-2); }
+.guard-sec h3 { font-size: 12.5px; font-weight: 600; white-space: nowrap; }
+.guard-sec .note { color: var(--ink-3); font-size: 11.5px; }
+/* 表格行尾的操作列：右对齐且按钮不换行（不动全局 .acts） */
+.guard-acts-cell { text-align: right; white-space: nowrap; }
+.guard-acts-cell .acts { display: inline-flex; vertical-align: middle; }
 .md-avail { flex: none; padding: 0 6px; font-size: 10.5px; line-height: 16px; }
 .rate-limits { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; min-width: 210px; }
 .rate-limit {
@@ -629,7 +636,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         任务中心</a></li>
       <li><a href="#models" data-view="models">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"/><path d="M2 5l6 3.2L14 5M8 8.2v6"/></svg>
-        模型与档位</a></li>
+        模型与档位<span class="tag bad" id="guardNavTag" hidden></span></a></li>
       <li><a href="#config" data-view="config">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.9M8 12.5v1.9M1.6 8h1.9M12.5 8h1.9M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"/></svg>
         配置</a></li>
@@ -775,6 +782,46 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
     <!-- 模型与档位 -->
     <section class="view" id="view-models" hidden>
+      <div class="box" id="guardBox" hidden>
+        <header>
+          <h3>试用/限免守卫 <span class="tag mute" id="guardStateTag">—</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="guardNote"></span>
+        </header>
+        <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr>
+              <th>模型</th><th>原因</th><th>扣费</th><th>检测时间</th><th style="text-align:right">操作</th>
+            </tr></thead>
+            <tbody id="guardDisabledBody"></tbody>
+          </table>
+        </div>
+        <div class="guard-sec">
+          <h3>时段规则（强制熔断）</h3>
+          <span class="note" id="guardBlockedNote"></span>
+        </div>
+        <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr>
+              <th>模型</th><th>模式</th><th>时段</th><th>星期</th><th style="text-align:right">操作</th>
+            </tr></thead>
+            <tbody id="guardWindowBody"></tbody>
+          </table>
+        </div>
+        <div class="fbar">
+          <input id="gwModel" type="text" placeholder="模型 ID（如 hy4-preview-f）" aria-label="模型 ID">
+          <input id="gwStart" type="text" placeholder="23:00" style="width:70px" aria-label="开始时间" title="开始 HH:MM">
+          <input id="gwEnd" type="text" placeholder="08:00" style="width:70px" aria-label="结束时间" title="结束 HH:MM，可跨午夜">
+          <input id="gwDays" type="text" placeholder="星期 1-7" style="width:96px" aria-label="星期" title="1=周一 … 7=周日，留空=每天">
+          <select id="gwMode" aria-label="模式" title="allow=仅窗口内允许；block=窗口内禁止">
+            <option value="allow">仅窗口内允许</option>
+            <option value="block">窗口内禁止</option>
+          </select>
+          <span class="grow"></span>
+          <button class="xs" id="gwAdd">添加</button>
+          <button class="xs ghost" id="gwCancel" hidden>取消编辑</button>
+        </div>
+      </div>
       <div class="box">
         <header>
           <h3>模型能力 <span class="hint">max_tokens bug已修复目前可以正常透传最大输出,但是官方返回的最大输出仅为参考，不保证完全正确

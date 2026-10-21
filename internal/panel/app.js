@@ -356,7 +356,10 @@ function go(v) {
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
   $('ttl').textContent = TITLES[v];
-  if (v === 'models' && !$('mdBody').children.length) loadModels();
+  if (v === 'models') {
+    if (!$('mdBody').children.length) loadModels();
+    loadTrialGuard();
+  }
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
@@ -635,6 +638,191 @@ function rateCell(m) {
       ' <span class="tag warn">' + esc(m.promo_label) + '</span></span>';
   }
   return m.credits ? esc(m.credits) : '—';
+}
+
+/* ── 试用/限免守卫：提醒 + 手动恢复 + 时段规则 ─────────────────── */
+let guardState = null;
+let guardEdit = null; // 正在编辑的时段规则原模型名（null = 新增模式）
+async function loadTrialGuard() {
+  try {
+    const d = await api('trial_guard');
+    guardState = d;
+    renderTrialGuard(d);
+  } catch (e) {
+    const box = $('guardBox');
+    if (box) box.hidden = true;
+    setGuardNav(0);
+  }
+}
+function setGuardNav(n) {
+  const el = $('guardNavTag');
+  if (!el) return;
+  el.hidden = !n;
+  el.textContent = n ? String(n) : '';
+}
+function renderTrialGuard(d) {
+  const box = $('guardBox');
+  const db = $('guardDisabledBody'), wb = $('guardWindowBody');
+  if (!box || !db || !wb) return;
+  if (!d || d.enabled === false) { box.hidden = true; setGuardNav(0); return; }
+  box.hidden = false;
+  const disabled = d.disabled || [];
+  const watch = d.watch || [];
+  const windows = d.windows || [];
+  const paused = d.paused || {};
+  const blockedNow = d.window_blocked || [];
+  const tag = $('guardStateTag'), note = $('guardNote');
+  if (note) note.textContent = '监控中：' + (watch.length ? watch.join(', ') : '—');
+  setGuardNav(disabled.length + blockedNow.length);
+
+  // ── 已熔断表 ──
+  if (tag) {
+    tag.className = disabled.length ? 'tag bad' : 'tag ok';
+    tag.textContent = disabled.length ? disabled.length + ' 个已熔断' : '正常';
+  }
+  if (!disabled.length) {
+    db.innerHTML = '<tr><td colspan="5"><div class="empty"><div class="big">暂无熔断</div>试用/限免模型开始计费或到期时会自动出现在这里</div></td></tr>';
+  } else {
+    db.innerHTML = disabled.map(e => {
+      const reason = e.reason === 'promo_expired' ? '限免到期'
+        : e.reason === 'window_blocked' ? '时段规则' : '开始计费';
+      const at = e.detected_at ? String(e.detected_at).replace('T', ' ').slice(0, 19) : '—';
+      const pausedUntil = paused[e.model];
+      const when = pausedUntil
+        ? at + '<br><span class="note">监控暂停至 ' + esc(String(pausedUntil).replace('T', ' ').slice(0, 16)) + '</span>'
+        : at;
+      return '<tr>' +
+        '<td><strong>' + esc(e.model) + '</strong></td>' +
+        '<td><span class="tag bad">' + esc(reason) + '</span></td>' +
+        '<td class="num">' + esc(e.credit ? e.credit : '—') + '</td>' +
+        '<td>' + when + '</td>' +
+        '<td class="guard-acts-cell"><div class="acts">' +
+        '<button class="xs" data-guard-restore="' + esc(e.model) + '" data-pause="0" title="立即放行；若仍在计费会再次熔断">恢复</button>' +
+        '<button class="xs ghost" data-guard-restore="' + esc(e.model) + '" data-pause="1" title="放行并暂停监控 1 小时">+1h</button>' +
+        '<button class="xs ghost" data-guard-restore="' + esc(e.model) + '" data-pause="24" title="放行并暂停监控 24 小时">+24h</button>' +
+        '</div></td></tr>';
+    }).join('');
+  }
+
+  // ── 时段规则表 ──
+  const bn = $('guardBlockedNote');
+  if (bn) bn.textContent = blockedNow.length ? '当前被挡住：' + blockedNow.join('、') : '';
+  if (!windows.length) {
+    wb.innerHTML = '<tr><td colspan="5"><div class="empty"><div class="big">暂无规则</div>给「只有夜间免费」的模型加一条 allow 规则，白天就会自动熔断</div></td></tr>';
+  } else {
+    wb.innerHTML = windows.map(w =>
+      '<tr>' +
+      '<td><strong>' + esc(w.model) + '</strong></td>' +
+      '<td><span class="tag ' + (w.mode === 'allow' ? 'ok' : 'warn') + '">' +
+        esc(w.mode === 'allow' ? '仅窗口内允许' : '窗口内禁止') + '</span></td>' +
+      '<td>' + esc(w.start + '–' + w.end) + '</td>' +
+      '<td class="note">' + esc(w.days && w.days.length ? '周' + w.days.join('') : '每天') + '</td>' +
+      '<td class="guard-acts-cell"><div class="acts">' +
+      '<button class="xs ghost" data-guard-window-edit="' + esc(w.model) + '">编辑</button>' +
+      '<button class="xs ghost" data-guard-window-remove="' + esc(w.model) + '">删除</button>' +
+      '</div></td></tr>').join('');
+  }
+  bindGuardActions();
+}
+
+// 守卫卡片的事件绑定（表格重建后需要重新绑）。
+function bindGuardActions() {
+  const body = $('guardDisabledBody');
+  const win = $('guardWindowBody');
+  const scope = [body, win, $('gwModel') && $('gwModel').closest('.fbar')].filter(Boolean);
+  scope.forEach(root => {
+    root.querySelectorAll('[data-guard-restore]').forEach(btn => {
+      btn.onclick = async () => {
+        const model = btn.getAttribute('data-guard-restore');
+        const hours = Number(btn.getAttribute('data-pause') || 0);
+        const tip = hours > 0
+          ? '恢复 ' + model + ' 并暂停监控 ' + hours + ' 小时？\n\n暂停期内不会因扣费自动熔断（时段规则仍生效）。'
+          : '恢复 ' + model + '？\n\n如果它仍在计费，下一次请求会再次触发熔断。';
+        if (!confirm(tip)) return;
+        btn.disabled = true;
+        try {
+          await api('trial_guard/restore', { method: 'POST', body: JSON.stringify({ model, pause_hours: hours }) });
+          toast(hours > 0 ? ('已恢复 ' + model + '，监控暂停 ' + hours + ' 小时') : ('已恢复 ' + model), 'ok');
+          await loadTrialGuard();
+          await loadModels();
+        } catch (err) {
+          toast('操作失败：' + err.message, 'err');
+          await loadTrialGuard();
+        }
+      };
+    });
+    root.querySelectorAll('[data-guard-window-remove]').forEach(btn => {
+      btn.onclick = async () => {
+        const model = btn.getAttribute('data-guard-window-remove');
+        if (!confirm('删除 ' + model + ' 的全部时段规则？')) return;
+        await api('trial_guard/window/remove', { method: 'POST', body: JSON.stringify({ model }) });
+        toast('已删除 ' + model + ' 的时段规则', 'ok');
+        await loadTrialGuard();
+        await loadModels();
+      };
+    });
+    root.querySelectorAll('[data-guard-window-edit]').forEach(btn => {
+      btn.onclick = () => {
+        const model = btn.getAttribute('data-guard-window-edit');
+        const rule = (guardState && guardState.windows || []).find(w => w.model === model);
+        if (!rule) return;
+        guardEdit = model;
+        $('gwModel').value = rule.model;
+        $('gwStart').value = rule.start;
+        $('gwEnd').value = rule.end;
+        $('gwDays').value = (rule.days || []).join('');
+        $('gwMode').value = rule.mode === 'block' ? 'block' : 'allow';
+        $('gwAdd').textContent = '保存修改';
+        $('gwCancel').hidden = false;
+        toast('正在编辑 ' + model + ' 的规则，改完点「保存修改」', 'ok');
+      };
+    });
+  });
+
+  const cancel = $('gwCancel');
+  if (cancel && !cancel.dataset.bound) {
+    cancel.dataset.bound = '1';
+    cancel.onclick = () => resetGuardForm();
+  }
+  const add = $('gwAdd');
+  if (add && !add.dataset.bound) {
+    add.dataset.bound = '1';
+    add.onclick = async () => {
+      const rule = {
+        model: $('gwModel').value.trim(),
+        start: $('gwStart').value.trim(),
+        end: $('gwEnd').value.trim(),
+        days: ($('gwDays').value.trim().match(/[1-7]/g) || []).map(Number),
+        mode: $('gwMode').value,
+      };
+      if (!rule.model || !rule.start || !rule.end) { toast('请填写模型、开始和结束时间', 'err'); return; }
+      add.disabled = true;
+      try {
+        // 编辑模式：先删旧规则（模型名也可能被改），再写新规则。
+        if (guardEdit) {
+          await api('trial_guard/window/remove', { method: 'POST', body: JSON.stringify({ model: guardEdit }) });
+        }
+        await api('trial_guard/window', { method: 'POST', body: JSON.stringify(rule) });
+        toast(guardEdit ? ('已更新 ' + rule.model + ' 的时段规则') : '已添加时段规则', 'ok');
+        resetGuardForm();
+        await loadTrialGuard();
+        await loadModels();
+      } catch (err) {
+        toast('保存失败：' + err.message, 'err');
+        add.disabled = false;
+        await loadTrialGuard();
+      }
+    };
+  }
+}
+
+function resetGuardForm() {
+  guardEdit = null;
+  $('gwModel').value = ''; $('gwStart').value = ''; $('gwEnd').value = ''; $('gwDays').value = '';
+  $('gwMode').value = 'allow';
+  $('gwAdd').textContent = '添加';
+  $('gwAdd').disabled = false;
+  $('gwCancel').hidden = true;
 }
 
 async function loadModels() {
@@ -1559,6 +1747,8 @@ function refreshVisible() {
 }
 function start() {
   loadOverview(true);
+  // 守卫状态：首屏即拉一次，让导航红点在用户点进「模型与档位」前就亮起。
+  loadTrialGuard();
   loadCompensation();                       // 补偿状态：首次进页面查一次（之后靠新鲜窗口）
   if (refTimer) clearInterval(refTimer);
   refTimer = setInterval(refreshVisible, 5000);

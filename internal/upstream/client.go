@@ -1307,27 +1307,40 @@ type ModelInfo struct {
 	PromoCredits string   // 折扣后倍率原文（如 "0x" / "0.50x"），仅展示
 	PromoLabel   string   // 徽章文案（限时免费 / 夜间折扣 / 错峰使用）
 	PromoNote    string   // hover 说明原文（含时段/日期描述）
-
-	// 优惠的机器可读明细（/v1/models 透出，客户端据此算生效价/判断窗口）：
-	//   PromoActive       此刻是否按折扣计价（true=生效价即 PromoCredits）
-	//   PromoWindowKind   "discount"（有 discount.factor）/ "offpeak"（窗口是高峰）/
-	//                     "badge"（仅徽章）
-	//   PromoWindow       折扣窗口（discount 类），如 "23:00-8:00"
-	//   PromoPeakWindow   高峰窗口（offpeak 类），如 "09:00-12:00,14:00-18:00"
-	//   PromoWeekdaysOnly offpeak 是否仅工作日（周末全天非高峰）
-	//   PromoValidFrom/Until 活动有效期（RFC3339，来自 schedule）
-	//   PromoTimezone     活动时区（schedule.timezone）
-	//   PromoDerived      true=PromoFactor/Window 由 hover 文案派生，
-	//                     置信度低于上游 machine-readable 字段
-	PromoActive       bool
-	PromoWindowKind   string
-	PromoWindow       string
-	PromoPeakWindow   string
-	PromoWeekdaysOnly bool
-	PromoValidFrom    string
-	PromoValidUntil   string
-	PromoTimezone     string
-	PromoDerived      bool
+	// PromoWindow / PromoTimezone / PromoActive 是给 OpenAI 兼容的 /v1/models
+	// 用的机器可读时段：客户端（如远端 DSH 的子代理路由）需要知道「现在是否在
+	// 折扣窗口内」，光有 note 文案无法判断。Window 形如 "23:00-07:50"，多条
+	// daily 窗口用逗号连接；Active 只在 promoActive 通过时才有值（本结构体的
+	// 优惠字段本身也只在生效时挂载）。
+	PromoWindow   string // "23:00-07:50" 或 "09:00-12:00,14:00-18:00"
+	PromoTimezone string // 上游 schedule.timezone，实测恒 Asia/Shanghai
+	// PromoActive 表示「折扣已被机器证实生效」——只有条目带 discount.factor 才置
+	// true。badge-only 条目（错峰使用 / 夜间折扣的白天展示位）为 false：它只证明
+	// 「有这个活动」，不证明「此刻按折扣计价」，客户端须读 PromoNote 判断。
+	// 宁可少报折扣（高估成本）也不要多报（低估成本导致子代理误选）。
+	PromoActive bool
+	// PromoWindowKind 说明 PromoWindow 的语义，避免客户端判反：
+	//   "discount" - 该窗口就是折扣生效窗口（条目带 discount.factor）
+	//   "badge"    - 该窗口只是徽章展示窗口，真实折扣时段可能相反或在文案里
+	//                （实测 glm-5.2 白天 badge(7:50-23:00) 与夜间五折是两条独立条目）
+	PromoWindowKind string
+	PromoValidFrom  string // schedule.validFrom（RFC3339，可空）
+	PromoValidUntil string // schedule.validUntil（RFC3339，可空）
+	// 以下三个字段只在「上游只给了 hover 文案、没有 discount.factor」时由
+	// promo_note.go 解析得出（PromoDerived=true）。官方改时段/折扣比例时，
+	// 只要文案格式不变就会自动跟随，无需改代码。
+	PromoPeakWindow   string // Kind=offpeak 时的高峰窗口，如 "09:00-12:00,14:00-18:00"
+	PromoWeekdaysOnly bool   // offpeak 是否仅工作日（周末全天折扣）
+	PromoDerived      bool   // true=值由文案派生，置信度低于上游 machine-readable 字段
+	// 计费通道：同一个模型可能有多条路由、显示名相同（如 hy3 免费额度 /
+	// hy3-x 超额付费、hy4-preview-f 免费试用 / hy4-preview 付费）。这是
+	// **计费路径差异，不是重复模型**，所以不改 name，只透出本字段供客户端
+	// 做「先免费、超额再付费」的路由。
+	//   free_quota    免费额度内（credits 为 0）
+	//   free_trial    限时免费试用（target_model_id 指向转正目标）
+	//   paid_overflow 免费额度/试用用尽后的付费通道
+	BillingRoute  string
+	TargetModelID string // 仅 free_trial 有值：转正后的目标模型 id
 }
 
 // dynModelEntry 上游模型目录（CN /console 与 global /v2 同构）的单条模型解析形态，
@@ -1756,9 +1769,12 @@ func applyModelPromotions(out map[string]ModelInfo, promos []v3ModelPromotion) {
 			mi.PromoFactor = &f
 			mi.PromoCredits = c.p.Discount.DiscountedCredits
 		}
+		// 机器可读时段（/v1/models 透出）：仅在 promoActive 通过的条目上有值，
+		// 客户端据此判断「现在是否处于折扣窗口」。window 为空的错峰类优惠
+		// （上游只在 hover 文案里写时段、不下发 schedule.daily）不编造。
 		// PromoActive 只在有 discount.factor 时置 true：badge-only 条目虽处于
-		// 「展示窗口」，但无法证明此刻按折扣计价（glm-5.2 白天 badge 与真实
-		// 折扣窗口 23:00-08:00 互为补集），宁可少报也不多报。
+		// 「展示窗口」，但无法证明此刻按折扣计价（glm-5.2 白天 badge 7:50-23:00，
+		// 真实折扣 23:00-08:00 反而是它的补集）。
 		mi.PromoActive = c.p.Discount != nil
 		mi.PromoWindowKind = "badge"
 		if c.p.Discount != nil {
@@ -2017,6 +2033,10 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 		}
 		mi.Credits = ""
 		mi.Tags = nil
+		// 试用通道：与转正目标同名同能力，但免费。标记出来供客户端做
+		// 「先试用、用尽/到期再换付费通道」的路由。
+		mi.BillingRoute = "free_trial"
+		mi.TargetModelID = strings.TrimSpace(b.TargetModelID)
 		out[id] = mi
 	}
 	// 挂当前生效的限时优惠（modelPromotions）：Credits 字段是**牌价**（转正后基准

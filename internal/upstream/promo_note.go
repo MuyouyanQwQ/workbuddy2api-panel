@@ -151,6 +151,9 @@ func parseCreditsRate(credits string) (float64, bool) {
 	return v, true
 }
 
+// CreditsRate 导出给 server 层判定计费通道（free_quota vs paid_overflow）。
+func CreditsRate(credits string) (float64, bool) { return parseCreditsRate(credits) }
+
 // formatCreditsRate 反向格式化，保留至多 3 位小数并去掉尾零（0.085 -> "x0.085"）。
 func formatCreditsRate(v float64) string {
 	text := strconv.FormatFloat(v, 'f', 3, 64)

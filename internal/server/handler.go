@@ -17,9 +17,9 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/guard"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/guard"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
@@ -57,6 +57,12 @@ type Config struct {
 	// PromptText custom 模式下注入的系统提示词文本（来自 config.PromptText）。
 	PromptText string
 
+	// PromptDynamicStatus 是否把实时模型状态（当前生效倍率、限免/试用截止、
+	// 已熔断模型）作为一条独立 system 消息注入请求。客户端（如 DSH）的模型
+	// schema 可能丢弃 /v1/models 的扩展字段，注入对话上下文是唯一不依赖客户端
+	// 改代码的“自动告知”方式。
+	PromptDynamicStatus bool
+
 	// GlobalEnabled global realm 路由开关（config global.enabled，缺省 true）。
 	// handler 侧第三道闸（与 main 注入 auth 开关、upstream.GlobalEnabled 呼应）：
 	// false（显式逃生门）时即便 auth realm=global 也不提供 global: 模型名
@@ -70,13 +76,12 @@ type Config struct {
 	// Usage 逐请求用量记录器（可选；nil = 不记录）。
 	// 在 recordAttempt 这一唯一汇聚点调用，因此流式/非流式、成功/失败都会计入，
 	// 且与 pool 的每账号累计器同源，两条口径不会漂移。
-	// TrialGuard 试用/限免模型熔断（可选；nil = 关闭）。
-	// 观测到监控名单内的模型产生 usage.credit（免费结束开始计费）或到达
-	// 限免截止时间时，持久禁用该模型：从 /v1/models 移除，并对该模型的请求
-	// 直接返回 403。也支持按时段强制熔断与手动恢复（见 guard 包）。
-	TrialGuard *guard.State
-
 	Usage *usage.Recorder
+
+	// TrialGuard 试用模型自动熔断（可选；nil = 关闭）。
+	// 观测到监控名单内的模型产生 usage.credit 时持久禁用该模型：
+	// 从 /v1/models 移除，并对该模型的请求直接返回 403。
+	TrialGuard *guard.State
 
 	// RequestLog 请求指标与脱敏 JSONL 归档（可选；nil = 不记录）。
 	RequestLog *reqlog.Recorder
@@ -356,8 +361,8 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 		entry["credits"] = mi.Credits // 积分倍率原文（如 "x0.05"），仅展示
 	}
 	// 限时优惠（modelPromotions）：credits 是牌价，promo_* 是当前生效折扣。
-	// 必须透出到 OpenAI 兼容的 /v1/models——远端客户端（子代理路由、CLI 工具）
-	// 只读这个接口，看不到 promo 就会按牌价误判模型成本。
+	// 这几个字段必须透出到 OpenAI 兼容的 /v1/models——远端客户端（如 DSH 的
+	// 子代理路由）只读这个接口，看不到 promo 就会按牌价误判模型成本。
 	// promo_active=true 仅表示「折扣已被 machine-readable 证实生效」（条目带
 	// discount.factor）；badge-only 条目为 false，真实时段在 promo_note 里。
 	if mi.PromoLabel != "" {
@@ -391,6 +396,13 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 		// 值由 hover 文案派生：官方改时段会自动跟随，但置信度低于上游
 		// machine-readable 字段，客户端可据此决定是否二次确认。
 		entry["promo_derived"] = true
+	}
+	if mi.BillingRoute != "" {
+		// 计费通道：同一模型的多条路由共用 display name，靠本字段区分。
+		entry["billing_route"] = mi.BillingRoute
+	}
+	if mi.TargetModelID != "" {
+		entry["target_model_id"] = mi.TargetModelID
 	}
 	if mi.PromoValidFrom != "" {
 		entry["promo_valid_from"] = mi.PromoValidFrom
@@ -440,6 +452,127 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 // modelList 模型列表：CN 模型输出统一加 "cn:" 前缀（gateway 路由协议，与 resolveModel
 // 对称）；global.enabled=true 时追加 global: 前缀的国际版名单。
 // 纯动态：动态拉取失败/无号 → 该域空列表，无静态兜底。
+// annotateBillingRoutes 为「同显示名、不同计费通道」的条目补 billing_route。
+//
+// 上游把免费额度/试用与付费超额拆成不同 id，但共用同一个 name：
+//
+//	cn:hy3          (x0.00) / cn:hy3-x          (x0.05)
+//	cn:hy4-preview-f(试用)  / cn:hy4-preview     (x0.29)
+//
+// 这不是重复模型，改名反而会让用户以为是两个不同模型。正确做法是保留 name，
+// 用 billing_route 告诉客户端：先走免费通道，额度用尽/试用到期再切付费通道。
+func annotateBillingRoutes(entries []map[string]any) {
+	groups := map[string][]map[string]any{}
+	for _, e := range entries {
+		name, _ := e["name"].(string)
+		name = strings.ToLower(strings.TrimSpace(name))
+		if name == "" {
+			continue
+		}
+		groups[name] = append(groups[name], e)
+	}
+	for _, group := range groups {
+		if len(group) < 2 {
+			continue
+		}
+		hasTrial, hasFree, hasPaid := false, false, false
+		rates := make([]float64, len(group))
+		known := make([]bool, len(group))
+		for i, e := range group {
+			if route, _ := e["billing_route"].(string); route == "free_trial" {
+				hasTrial = true
+			}
+			credits, _ := e["credits"].(string)
+			rate, ok := upstream.CreditsRate(credits)
+			rates[i], known[i] = rate, ok
+			if !ok || rate == 0 {
+				hasFree = true
+			} else {
+				hasPaid = true
+			}
+		}
+		for i, e := range group {
+			if route, _ := e["billing_route"].(string); route != "" {
+				continue // free_trial 已由上游横幅标记
+			}
+			switch {
+			case hasTrial:
+				e["billing_route"] = "paid_overflow"
+			case hasFree && hasPaid:
+				if known[i] && rates[i] > 0 {
+					e["billing_route"] = "paid_overflow"
+				} else {
+					e["billing_route"] = "free_quota"
+				}
+			}
+		}
+	}
+}
+
+// dynamicStatusBlock 构造注入到 system 的实时模型状态摘要。
+// 只放稳定信息（不写当前时间），避免每次请求都改变前缀、打断 prompt cache。
+func (h *Handler) dynamicStatusBlock(model, rate string) string {
+	var b strings.Builder
+	b.WriteString("[网关模型状态]\n")
+	b.WriteString("当前模型：")
+	b.WriteString(model)
+	if rate != "" {
+		b.WriteString("（生效倍率 ")
+		if !strings.HasPrefix(rate, "x") {
+			b.WriteString("x")
+		}
+		b.WriteString(rate)
+		b.WriteString("）")
+	}
+	b.WriteString("\n")
+
+	infos := h.fetchDynamicModels()
+	free := make([]string, 0, 4)
+	for _, mi := range infos {
+		isFree := mi.BillingRoute == "free_trial" ||
+			(mi.PromoFactor != nil && *mi.PromoFactor == 0)
+		if !isFree {
+			continue
+		}
+		note := ""
+		if mi.BillingRoute == "free_trial" {
+			note = "试用"
+		}
+		if len(mi.PromoValidUntil) >= 10 {
+			if note != "" {
+				note += "，"
+			}
+			note += "至 " + mi.PromoValidUntil[:10]
+		}
+		if note == "" {
+			note = "限免"
+		}
+		free = append(free, mi.ID+"（"+note+"）")
+	}
+	if len(free) > 0 {
+		b.WriteString("限免/试用：")
+		b.WriteString(strings.Join(free, "；"))
+		b.WriteString("\n")
+	}
+
+	if h.cfg.TrialGuard != nil {
+		list := h.cfg.TrialGuard.List()
+		if len(list) == 0 {
+			b.WriteString("已熔断（不可用）：无\n")
+		} else {
+			ids := make([]string, 0, len(list))
+			for _, e := range list {
+				ids = append(ids, e.Model)
+			}
+			b.WriteString("已熔断（不可用）：")
+			b.WriteString(strings.Join(ids, "、"))
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString("选型规则：同等能力下优先选生效倍率最低且未熔断的模型。")
+	return b.String()
+}
+
 func (h *Handler) modelList() []map[string]any {
 	out := make([]map[string]any, 0)
 	// models.hidden 黑名单：快照外提，避免逐条目重复 Load。
@@ -519,6 +652,10 @@ func (h *Handler) modelList() []map[string]any {
 			if _, ok := hidden["global:"+id]; ok {
 				continue
 			}
+			// 试用守卫（global 域同样适用）。
+			if h.cfg.TrialGuard != nil && h.cfg.TrialGuard.Disabled(id) {
+				continue
+			}
 			entry := map[string]any{
 				"id":       "global:" + id,
 				"object":   "model",
@@ -544,6 +681,9 @@ func (h *Handler) modelList() []map[string]any {
 			out = append(out, entry)
 		}
 	}
+	// 同显示名不同计费通道（hy3/hy3-x、hy4-preview-f/hy4-preview）：
+	// 只补 billing_route，不改 name。
+	annotateBillingRoutes(out)
 	return out
 }
 
@@ -679,18 +819,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer st.done()
 
-	// models.hidden 黑名单：点名调用直接拒绝，不打上游、不占选号。
-	// 与 /v1/models 的列表过滤对称（只藏列表不够，知道名字仍可硬调）。
-	if _, hide := h.loadLive().HiddenModels[realm+":"+bareModel]; hide {
-		writeOpenAIErrorHint(w, http.StatusBadRequest, "model_unavailable",
-			"model is hidden by gateway configuration, try another model", "")
-		st.status = http.StatusBadRequest
-		st.outcome = reqlog.OutcomeHTTPError
-		return
-	}
-
-	// 试用守卫：模型一旦被观测到开始计费、限免到期或命中时段规则，后续请求
-	// 直接拒绝，避免在不知情的情况下继续扣积分。返回 403 而不是 404，让客户端
+	// 试用守卫：模型一旦被观测到开始计费、或限免活动到期，后续请求直接拒绝，
+	// 避免在不知情的情况下继续扣积分。返回 403 而不是 404，让客户端
 	// 能区分「模型不存在」与「试用/限免结束被网关禁用」。
 	if h.cfg.TrialGuard != nil {
 		if entry, disabled := h.cfg.TrialGuard.DisabledEntry(bareModel); disabled {
@@ -705,6 +835,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.status = http.StatusForbidden
 			return
 		}
+	}
+	// models.hidden 黑名单：点名调用直接拒绝，不打上游、不占选号。
+	// 与 /v1/models 的列表过滤对称（只藏列表不够，知道名字仍可硬调）。
+	if _, hide := h.loadLive().HiddenModels[realm+":"+bareModel]; hide {
+		writeOpenAIErrorHint(w, http.StatusBadRequest, "model_unavailable",
+			"model is hidden by gateway configuration, try another model", "")
+		st.status = http.StatusBadRequest
+		st.outcome = reqlog.OutcomeHTTPError
+		return
 	}
 
 	tried := map[string]bool{}
@@ -837,7 +976,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}, delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens)
 		}
 
-		// 试用守卫：上游一旦对监控名单内的模型返回 credit>0，说明免费试用/限免
+		// 试用守卫：上游一旦对监控名单内的模型返回 credit>0，说明免费试用
 		// 已结束、开始计费——立即熔断并持久化，后续请求直接拒绝。
 		if h.cfg.TrialGuard != nil && hasCredit && credit > 0 {
 			if h.cfg.TrialGuard.NoteCredit(delta.Model, credit) {
@@ -872,6 +1011,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	} else if (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && h.degrade.Active() {
 		body = prompt.Rewrite(body, prompt.Degraded)
 		degradedApplied = true
+	}
+
+	// 动态模型状态注入：把当前生效倍率、限免/试用截止、已熔断模型追加为
+	// 一条独立 system 消息，让客户端（DSH）在对话上下文中直接可见。
+	// 不依赖 /v1/models 的扩展字段（其模型 schema 可能丢弃未知字段）。
+	if h.cfg.PromptDynamicStatus {
+		if block := h.dynamicStatusBlock(bareModel, modelRate); block != "" {
+			body = prompt.Append(body, block)
+		}
 	}
 
 	// outbound model 名重写为 bareModel（D6）：realm 前缀是网关侧路由协议，

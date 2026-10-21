@@ -45,3 +45,10 @@ docs/
 *.zip
 server.exe
 .DS_Store
+
+# ── 本地维护版（DSH）新增 ──────────────────────────────
+out/
+.gocache/
+*.bak*
+*.bak-*
+*.log

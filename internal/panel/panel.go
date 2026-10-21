@@ -12,6 +12,7 @@ package panel
 
 import (
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/guard"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
@@ -44,6 +46,9 @@ type Config struct {
 
 	// Live 运行期可变配置（在线改配置立即生效）。
 	Live *livecfg.Holder
+
+	// Guard 试用/限免模型熔断状态（nil = 面板不展示守卫卡片，恢复接口返回 501）。
+	Guard *guard.State
 
 	// ConfigPath config.json 路径与加载器（配置页读写用）。
 	// LoadConfig 返回解析后的配置对象（前端展示/校验用，具体类型由 main 注入的闭包决定）；
@@ -161,6 +166,10 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
 	p.mux.HandleFunc("GET /panel/api/credit_history", p.withAuth(p.creditHistory))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
+	p.mux.HandleFunc("GET /panel/api/trial_guard", p.withAuth(p.trialGuardStatus))
+	p.mux.HandleFunc("POST /panel/api/trial_guard/restore", p.withAuth(p.trialGuardRestore))
+	p.mux.HandleFunc("POST /panel/api/trial_guard/window", p.withAuth(p.trialGuardWindowAdd))
+	p.mux.HandleFunc("POST /panel/api/trial_guard/window/remove", p.withAuth(p.trialGuardWindowRemove))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
@@ -466,6 +475,85 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
+}
+
+// trialGuardStatus 返回试用/限免守卫的当前状态（面板卡片 + 导航红点用）。
+func (p *Panel) trialGuardStatus(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Guard == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "enabled": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":             true,
+		"enabled":        true,
+		"watch":          p.cfg.Guard.WatchList(),
+		"disabled":       p.cfg.Guard.List(),
+		"deadlines":      p.cfg.Guard.Deadlines(),
+		"windows":        p.cfg.Guard.Windows(),
+		"window_blocked": p.cfg.Guard.WindowBlockedNow(),
+		"paused":         p.cfg.Guard.PausedList(),
+	})
+}
+
+// trialGuardRestore 手动恢复一个被熔断的模型。
+// pause_hours > 0 时同时暂停监控对应小时数（期间不因积分/到期自动熔断）。
+// 保留 deadline：若时间熔断点仍已过期，下一次访问会立刻再次熔断。
+func (p *Panel) trialGuardRestore(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Guard == nil {
+		writeErr(w, http.StatusNotImplemented, "trial guard disabled")
+		return
+	}
+	var body struct {
+		Model      string  `json:"model"`
+		PauseHours float64 `json:"pause_hours"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	model := strings.TrimSpace(body.Model)
+	if model == "" {
+		writeErr(w, http.StatusBadRequest, "model is required")
+		return
+	}
+	pause := time.Duration(body.PauseHours * float64(time.Hour))
+	restored := p.cfg.Guard.Restore(model, pause)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "restored": restored})
+}
+
+// trialGuardWindowAdd 新增一条时段熔断规则。
+func (p *Panel) trialGuardWindowAdd(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Guard == nil {
+		writeErr(w, http.StatusNotImplemented, "trial guard disabled")
+		return
+	}
+	var rule guard.WindowRule
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&rule); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := p.cfg.Guard.SetWindow(rule); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// trialGuardWindowRemove 删除某模型的全部时段规则。
+func (p *Panel) trialGuardWindowRemove(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Guard == nil {
+		writeErr(w, http.StatusNotImplemented, "trial guard disabled")
+		return
+	}
+	var body struct {
+		Model string `json:"model"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	removed := p.cfg.Guard.RemoveWindows(strings.TrimSpace(body.Model))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "removed": removed})
 }
 
 // panelModelEntry 构造单个模型条目（两域共用）：id 带 realm 前缀（调用值即显示值），

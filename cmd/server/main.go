@@ -287,21 +287,11 @@ func main() {
 		log.Printf("[reqlog] 请求指标已启用；JSONL 归档已关闭")
 	}
 
-	// 积分历史：把每次真实查到的余额与上一次比对，变动即留痕（新账号首次只建
-	// 基线）。挂载在余额查询路径上（upstream 的余额观察者），签到 / 活跃上报 /
-	// 旅行 / 保活 / 面板手动刷新全覆盖——上游只在少数渠道落金额日志，比对余额
-	// 是唯一可靠的口径。与 state/usage/request-logs 同目录，随 state_file 搬移。
-	creditHist := credithist.New(stateSibling(cfg.StateFile, "credit-history.json"), 2000)
-	up.SetCreditObserver(creditHist.Observe)
-	log.Printf("[credithist] 积分历史已启用: %s", stateSibling(cfg.StateFile, "credit-history.json"))
-
-	// 试用守卫：监控名单内的试用/限免模型一旦产生 usage.credit（免费结束开始
-	// 计费），立即持久禁用并从 /v1/models 移除；到达 promo_valid_until 自动下线；
-	// 上游延长免费则自动复活（同一份已被证伪的声明除外）。
+	// 试用守卫：监控名单内的试用模型一旦产生 usage.credit（试用结束开始计费），
+	// 立即持久禁用并从 /v1/models 移除。默认监控 hy4-preview-f。
 	//   TRIAL_GUARD_ENABLED=false  关闭
 	//   TRIAL_GUARD_WATCH=a,b      监控名单（逗号分隔，可带 cn: 前缀）
 	//   TRIAL_GUARD_STATE=path     状态文件（默认 data/trial_guard.json）
-	//   TRIAL_GUARD_WINDOWS=模型|HH:MM-HH:MM|[星期1-7]|[block|allow]  时段规则
 	var trialGuard *guard.State
 	if !strings.EqualFold(os.Getenv("TRIAL_GUARD_ENABLED"), "false") {
 		guardPath := os.Getenv("TRIAL_GUARD_STATE")
@@ -310,6 +300,10 @@ func main() {
 		}
 		guardWatch := os.Getenv("TRIAL_GUARD_WATCH")
 		if guardWatch == "" {
+			// 默认监控：试用通道 + 两个限免活动模型。
+			//   hy4-preview-f  14 天试用（靠积分熔断）
+			//   step-5-preview 独家限免至 2026-10-25（靠时间熔断）
+			//   hy3            限时免费至 2026-11-01（靠时间熔断）
 			guardWatch = "hy4-preview-f,step-5-preview,hy3"
 		}
 		trialGuard = guard.New(guardPath, strings.Split(guardWatch, ","))
@@ -320,6 +314,9 @@ func main() {
 		for m, d := range trialGuard.Deadlines() {
 			log.Printf("INFO: [server] trial guard deadline model=%s at=%s", m, d.Format(time.RFC3339))
 		}
+		// 时段规则（env 初始化，之后可在面板增删）：
+		//   TRIAL_GUARD_WINDOWS="hy4-preview-f|23:00-08:00||allow,step-5-preview|09:00-18:00|12345|block"
+		//   格式：模型|HH:MM-HH:MM|[星期 1-7 连写]|[block|allow]
 		if spec := os.Getenv("TRIAL_GUARD_WINDOWS"); strings.TrimSpace(spec) != "" {
 			for _, r := range parseGuardWindows(spec) {
 				if err := trialGuard.SetWindow(r); err != nil {
@@ -331,6 +328,13 @@ func main() {
 			}
 		}
 	}
+	// 积分历史：把每次真实查到的余额与上一次比对，变动即留痕（新账号首次只建
+	// 基线）。挂载在余额查询路径上（upstream 的余额观察者），签到 / 活跃上报 /
+	// 旅行 / 保活 / 面板手动刷新全覆盖——上游只在少数渠道落金额日志，比对余额
+	// 是唯一可靠的口径。与 state/usage/request-logs 同目录，随 state_file 搬移。
+	creditHist := credithist.New(stateSibling(cfg.StateFile, "credit-history.json"), 2000)
+	up.SetCreditObserver(creditHist.Observe)
+	log.Printf("[credithist] 积分历史已启用: %s", stateSibling(cfg.StateFile, "credit-history.json"))
 
 	pn := panel.New(panel.Config{
 		Pool:        p,
@@ -344,6 +348,7 @@ func main() {
 		StickyCount: sessCount,
 		Version:     appVersion,
 		Live:        live,
+		Guard:       trialGuard,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
@@ -366,6 +371,8 @@ func main() {
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
 
+	// （试用守卫初始化已前移到 panel.New 之前，供面板状态/恢复接口复用）
+
 	h := server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
@@ -376,15 +383,17 @@ func main() {
 		SoftCooldown: cfg.SoftRateDur,
 		Panel:        pn,
 		Live:         live,
+		TrialGuard:   trialGuard,
 		Usage:        rec,
 		RequestLog:   requestLog,
 		PromptMode:   cfg.Prompt.Mode,
 		PromptText:   cfg.PromptText,
+		// 实时模型状态注入（默认开启；PROMPT_DYNAMIC_STATUS=false 关闭）。
+		PromptDynamicStatus: !strings.EqualFold(os.Getenv("PROMPT_DYNAMIC_STATUS"), "false"),
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
 		// 裸用/测试路径拿到同一缺省值。
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
-		TrialGuard:   trialGuard,
 		GlobalEnabled: cfg.Global.Enabled,
 		// 模型黑名单原始条目；运行期以 livecfg 快照为准（热生效），此处供
 		// Live 为 nil 的裸用/测试路径。
@@ -660,8 +669,8 @@ func mergedJSON(m map[string]any) []byte {
 //
 //	模型|HH:MM-HH:MM|[星期1-7连写]|[block|allow]，多条用逗号分隔
 //
-//	例：hy4-preview-f|23:00-08:00||allow   （只在夜间允许，白天强制熔断）
-//	    step-5-preview|09:00-18:00|12345|block （工作日白天强制熔断）
+// 例：hy4-preview-f|23:00-08:00||allow   （只在夜间允许，白天强制熔断）
+//     step-5-preview|09:00-18:00|12345|block （工作日白天强制熔断）
 func parseGuardWindows(spec string) []guard.WindowRule {
 	out := make([]guard.WindowRule, 0, 4)
 	for _, item := range strings.Split(spec, ",") {
