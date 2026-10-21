@@ -13,7 +13,7 @@ let refTimer = null;
 let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
 let mdAll = [], mdProbes = {}, mdProbeOf = () => undefined;
 let mdLocks = [], mdRecent = [];
-let reqFilter = { q: '', outcome: '' };
+let reqFilter = { q: '', outcome: '', account: '', model: '' };
 let reqEntries = [];
 let usDim = 'account', usCreditDim = 'account', usSort = 'total';
 let usageData = null;
@@ -651,20 +651,34 @@ async function loadTrialGuard() {
   } catch (e) {
     const box = $('guardBox');
     if (box) box.hidden = true;
-    setGuardNav(0);
+    setGuardNav(0, 0);
   }
 }
-function setGuardNav(n) {
+/* setGuardNav 导航角标：红=已熔断（模型不可用），黄=仅当前时段受限（会恢复）。
+   数字取严重的一侧，避免「1 个熔断 + 2 个时段受限」被读成 3 个熔断。 */
+function setGuardNav(disabledCount, restrictedCount) {
   const el = $('guardNavTag');
   if (!el) return;
-  el.hidden = !n;
-  el.textContent = n ? String(n) : '';
+  const broken = Number(disabledCount) || 0;
+  const limited = Number(restrictedCount) || 0;
+  if (!broken && !limited) {
+    el.hidden = true;
+    el.textContent = '';
+    el.removeAttribute('title');
+    return;
+  }
+  el.hidden = false;
+  el.className = broken > 0 ? 'tag bad' : 'tag warn';
+  el.textContent = String(broken > 0 ? broken : limited);
+  el.title = broken > 0
+    ? broken + ' 个模型已熔断（不可用）'
+    : limited + ' 个模型当前时段受限（到点自动恢复）';
 }
 function renderTrialGuard(d) {
   const box = $('guardBox');
   const db = $('guardDisabledBody'), wb = $('guardWindowBody');
   if (!box || !db || !wb) return;
-  if (!d || d.enabled === false) { box.hidden = true; setGuardNav(0); return; }
+  if (!d || d.enabled === false) { box.hidden = true; setGuardNav(0, 0); return; }
   box.hidden = false;
   const disabled = d.disabled || [];
   const watch = d.watch || [];
@@ -673,7 +687,7 @@ function renderTrialGuard(d) {
   const blockedNow = d.window_blocked || [];
   const tag = $('guardStateTag'), note = $('guardNote');
   if (note) note.textContent = '监控中：' + (watch.length ? watch.join(', ') : '—');
-  setGuardNav(disabled.length + blockedNow.length);
+  setGuardNav(disabled.length, blockedNow.length); // 红=熔断 黄=仅时段受限
 
   // ── 已熔断表 ──
   if (tag) {
@@ -1176,10 +1190,12 @@ async function loadCreditHistory() {
 }
 
 /* reqMatch 请求记录筛选：q 对 IP/UA/模型/账号/请求 ID 做空格分词的 AND 包含匹配，
-   outcome 精确匹配。两者都在已拉取的条目上做（最多 1000 条），不发新请求。 */
+   outcome / account / model 精确匹配。全部在已拉取的条目上做（最多 1000 条），不发新请求。 */
 function reqMatch(e, f) {
   f = f || reqFilter;
   if (f.outcome && String(e && e.outcome || '') !== f.outcome) return false;
+  if (f.account && String(e && e.account || '') !== f.account) return false;
+  if (f.model && String(e && e.model || '') !== f.model) return false;
   if (f.q) {
     const text = [e && e.client_ip, e && e.user_agent, e && e.model, e && e.account, e && e.request_id]
       .filter(Boolean).join(' ').toLowerCase();
@@ -1211,9 +1227,40 @@ function reqCreditCell(e) {
   return Number.isFinite(v) ? trimFixed(v.toFixed(2)) : '<span class="muted">—</span>';
 }
 
+/* syncReqSelects 用当前已拉取的条目刷新「账号 / 模型」下拉：
+   选项来自本次读取的数据（最多 1000 条），值变了才重建，避免每次按键都丢焦点；
+   选中的值若已不在新数据里，回落「全部」并同步清空筛选，免得筛出空白表格。 */
+const reqSelSig = { account: '', model: '' };
+function syncReqSelects() {
+  const fill = (id, key, allLabel) => {
+    const el = $(id);
+    if (!el) return;
+    const seen = [];
+    const uniq = new Set();
+    for (const e of reqEntries) {
+      const v = e && e[key] ? String(e[key]) : '';
+      if (v && !uniq.has(v)) { uniq.add(v); seen.push(v); }
+    }
+    seen.sort((a, b) => a.localeCompare(b, 'zh-CN'));
+    const cur = reqFilter[key] || '';
+    if (cur && !uniq.has(cur)) { reqFilter[key] = ''; }
+    const sig = seen.join('\u0001');
+    if (sig !== reqSelSig[key]) {
+      reqSelSig[key] = sig;
+      el.innerHTML = ['<option value="">' + esc(allLabel) + '（' + seen.length + '）</option>']
+        .concat(seen.map(v => '<option value="' + esc(v) + '">' + esc(v) + '</option>'))
+        .join('');
+    }
+    el.value = reqFilter[key] || '';
+  };
+  fill('reqAccount', 'account', '全部账号');
+  fill('reqModel', 'model', '全部模型');
+}
+
 /* renderRequestTable 渲染请求记录表。来源列是这一版的重点：IP 用等宽字体方便扫，
    UA 单行截断（完整值在 title 里，行本身用 requestLogText 作 tooltip）。 */
 function renderRequestTable() {
+  syncReqSelects();
   const list = reqEntries.filter(e => reqMatch(e));
   const tb = $('reqBody');
   if (!tb) return;
@@ -1257,6 +1304,14 @@ if ($('reqQ')) $('reqQ').oninput = () => {
 };
 if ($('reqOutcome')) $('reqOutcome').onchange = () => {
   reqFilter.outcome = $('reqOutcome').value;
+  renderRequestTable();
+};
+if ($('reqAccount')) $('reqAccount').onchange = () => {
+  reqFilter.account = $('reqAccount').value;
+  renderRequestTable();
+};
+if ($('reqModel')) $('reqModel').onchange = () => {
+  reqFilter.model = $('reqModel').value;
   renderRequestTable();
 };
 if ($('reqLimit')) $('reqLimit').onchange = loadLogs;
